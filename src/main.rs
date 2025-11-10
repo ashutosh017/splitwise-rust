@@ -1,6 +1,5 @@
 use argon2::{
-    Argon2,
-    password_hash::{ PasswordHasher, SaltString, rand_core::OsRng},
+    Argon2, PasswordHash, PasswordVerifier, password_hash::{PasswordHasher, SaltString, rand_core::OsRng}
 };
 use axum::{
     Router,
@@ -12,7 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use validator::{Validate};
+use validator::Validate;
+use jsonwebtoken::{encode, EncodingKey, Header};
 
 mod config;
 
@@ -35,6 +35,19 @@ struct SignupPayload {
 struct SignupResponse {
     message: &'static str,
     username: String,
+}
+#[derive(Validate)]
+struct SigninPayload {
+    #[validate(length(min = 1, message = "username cannot be empty"))]
+    username: String,
+    #[validate(length(min = 1, message = "password cannot be empty"))]
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
 }
 
 async fn signup(
@@ -61,17 +74,18 @@ async fn signup(
     };
 
     let salt = SaltString::generate(&mut OsRng);
+    println!("salt is: {}", salt.to_string());
 
     let argon2 = Argon2::default();
 
-    let password_hash =match argon2.hash_password(payload.password.as_bytes(), &salt){
+    let password_hash = match argon2.hash_password(payload.password.as_bytes(), &salt) {
         Ok(value) => value.to_string(),
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
                     "error":"Failed to hash the password"
-                }))
+                })),
             );
         }
     };
@@ -98,7 +112,7 @@ async fn signup(
                 StatusCode::OK,
                 Json(serde_json::to_value(response).unwrap()),
             )
-        },
+        }
         Err(Error::Database(db_err)) => {
             if db_err.code().as_deref() == Some("23505") {
                 // Unique violation
@@ -113,10 +127,7 @@ async fn signup(
                 } else {
                     "Duplicate entry"
                 };
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({"error": msg})),
-                )
+                (StatusCode::CONFLICT, Json(json!({"error": msg})))
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -131,11 +142,75 @@ async fn signup(
     }
 }
 
+async fn signin(
+    State(pool): State<PgPool>,
+    Json(payload): Json<SigninPayload>,
+) -> impl IntoResponse {
+    // Validate payload
+    if let Err(errors) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "errors": errors })),
+        );
+    }
+
+    // Fetch user from DB
+    let user = sqlx::query!(
+        "SELECT password FROM users WHERE username = $1",
+        payload.username
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    if let Some(user) = user {
+        // Verify password
+        let parsed_hash = PasswordHash::new(&user.password).unwrap();
+        if Argon2::default()
+            .verify_password(payload.password.as_bytes(), &parsed_hash)
+            .is_err()
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid credentials" })),
+            );
+        }
+
+        // Create JWT
+        let exp = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::hours(24))
+            .unwrap()
+            .timestamp() as usize;
+
+        let claims = Claims {
+            sub: payload.username.clone(),
+            exp,
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"your_jwt_secret"),
+        )
+        .unwrap();
+
+        return (
+            StatusCode::OK,
+            Json(json!({ "message": "signin successful", "token": token })),
+        );
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "user not found" })),
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect("postgres://postgres:postgres@localhost:5432/splitwise")
+        .connect(config::DATABASE_URL)
         .await?;
     println!("Connected to Postgres!");
 

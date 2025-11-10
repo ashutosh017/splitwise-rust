@@ -12,3 +12,4 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "macros"] }
 anyhow = "1"
 argon2 = "0.5.3"
+jsonwebtoken = "10.2.0"
